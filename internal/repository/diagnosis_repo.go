@@ -2,6 +2,7 @@ package repository
 
 import (
 	"errors"
+	"fmt"
 	"time"
 
 	"gorm.io/gorm"
@@ -20,6 +21,11 @@ type DiagnosisRepository interface {
 	ExistsByTaskID(taskID string) (bool, error)
 	GetLatestByDeviceNo(deviceNo string, limit int) ([]*model.DiagnosisResult, error)
 	GetStats(deviceNo string, startTime, endTime time.Time) (map[string]interface{}, error)
+
+	AcquireTask(taskID string) (*model.DiagnosisResult, error)
+	CompleteTask(result *model.DiagnosisResult, version int64) (*model.DiagnosisResult, error)
+	FailTask(taskID string, errorMsg string, version int64) (*model.DiagnosisResult, error)
+	GetDB() *gorm.DB
 }
 
 type diagnosisRepository struct {
@@ -28,6 +34,10 @@ type diagnosisRepository struct {
 
 func NewDiagnosisRepository(db *gorm.DB) DiagnosisRepository {
 	return &diagnosisRepository{db: db}
+}
+
+func (r *diagnosisRepository) GetDB() *gorm.DB {
+	return r.db
 }
 
 func (r *diagnosisRepository) Create(result *model.DiagnosisResult) error {
@@ -201,4 +211,145 @@ func (r *diagnosisRepository) GetStats(deviceNo string, startTime, endTime time.
 		"avg_anomaly_score": result.AvgAnomalyScore,
 		"max_anomaly_score": result.MaxAnomalyScore,
 	}, nil
+}
+
+func (r *diagnosisRepository) AcquireTask(taskID string) (*model.DiagnosisResult, error) {
+	var result model.DiagnosisResult
+
+	err := r.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Set("gorm:query_option", "FOR UPDATE").
+			Where("task_id = ?", taskID).
+			First(&result).Error; err != nil {
+			return err
+		}
+
+		switch result.Status {
+		case model.DiagnosisStatusComplete:
+			return fmt.Errorf("%s: %s", model.TaskAlreadyCompleted, taskID)
+		case model.DiagnosisStatusRunning:
+			return fmt.Errorf("%s: %s", model.TaskAlreadyRunning, taskID)
+		case model.DiagnosisStatusPending, model.DiagnosisStatusFailed:
+		default:
+			return fmt.Errorf("%s: cannot transition from %s", model.StateTransitionError, result.Status)
+		}
+
+		now := time.Now()
+		result.Status = model.DiagnosisStatusRunning
+		result.StartTime = now
+		result.Version++
+		result.UpdatedAt = now
+
+		if err := tx.Save(&result).Error; err != nil {
+			return err
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
+
+func (r *diagnosisRepository) CompleteTask(result *model.DiagnosisResult, version int64) (*model.DiagnosisResult, error) {
+	var updated model.DiagnosisResult
+
+	err := r.db.Transaction(func(tx *gorm.DB) error {
+		var current model.DiagnosisResult
+		if err := tx.Set("gorm:query_option", "FOR UPDATE").
+			Where("task_id = ?", result.TaskID).
+			First(&current).Error; err != nil {
+			return err
+		}
+
+		if current.Version != version {
+			return fmt.Errorf("%s: expected %d, got %d", model.VersionMismatch, version, current.Version)
+		}
+
+		if current.Status == model.DiagnosisStatusComplete {
+			result = &current
+			return nil
+		}
+
+		if current.Status != model.DiagnosisStatusRunning {
+			return fmt.Errorf("%s: cannot complete from status %s", model.StateTransitionError, current.Status)
+		}
+
+		now := time.Now()
+		current.Status = model.DiagnosisStatusComplete
+		current.EndTime = &now
+		current.Version++
+		current.UpdatedAt = now
+
+		current.MainFrequency = result.MainFrequency
+		current.MainEnergy = result.MainEnergy
+		current.HarmonicEnergies = result.HarmonicEnergies
+		current.BandEnergies = result.BandEnergies
+		current.AnomalyScore = result.AnomalyScore
+		current.AnomalyType = result.AnomalyType
+		current.AnomalyDetails = result.AnomalyDetails
+		current.FFTResult = result.FFTResult
+		current.RuleVersion = result.RuleVersion
+
+		if err := tx.Save(&current).Error; err != nil {
+			return err
+		}
+
+		updated = current
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return &updated, nil
+}
+
+func (r *diagnosisRepository) FailTask(taskID string, errorMsg string, version int64) (*model.DiagnosisResult, error) {
+	var updated model.DiagnosisResult
+
+	err := r.db.Transaction(func(tx *gorm.DB) error {
+		var current model.DiagnosisResult
+		if err := tx.Set("gorm:query_option", "FOR UPDATE").
+			Where("task_id = ?", taskID).
+			First(&current).Error; err != nil {
+			return err
+		}
+
+		if current.Version != version {
+			return fmt.Errorf("%s: expected %d, got %d", model.VersionMismatch, version, current.Version)
+		}
+
+		if current.Status == model.DiagnosisStatusComplete {
+			updated = current
+			return nil
+		}
+
+		if current.Status != model.DiagnosisStatusRunning {
+			return fmt.Errorf("%s: cannot fail from status %s", model.StateTransitionError, current.Status)
+		}
+
+		now := time.Now()
+		current.Status = model.DiagnosisStatusFailed
+		current.EndTime = &now
+		current.ErrorMsg = errorMsg
+		current.Version++
+		current.UpdatedAt = now
+
+		if err := tx.Save(&current).Error; err != nil {
+			return err
+		}
+
+		updated = current
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return &updated, nil
 }

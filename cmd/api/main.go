@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -73,9 +72,6 @@ func main() {
 	ruleHandler := handler.NewRuleHandler(ruleService)
 
 	r := app.SetupRouter(valveHandler, waveformHandler, diagnosisHandler, ruleHandler)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	srv := &http.Server{
 		Addr:    cfg.Server.Addr(),

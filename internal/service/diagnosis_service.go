@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"nuclear-valve-vibration-api/internal/cache"
@@ -27,14 +28,14 @@ type DiagnosisService interface {
 }
 
 type diagnosisService struct {
-	repo        repository.DiagnosisRepository
-	waveformRepo repository.WaveformRepository
-	valveRepo    repository.ValveRepository
-	ruleRepo     repository.RuleRepository
-	cache        cache.Cache
-	fftAnalyzer  *fft.Analyzer
+	repo            repository.DiagnosisRepository
+	waveformRepo    repository.WaveformRepository
+	valveRepo       repository.ValveRepository
+	ruleRepo        repository.RuleRepository
+	cache           cache.Cache
+	fftAnalyzer     *fft.Analyzer
 	diagnosisEngine *diagnosis.Engine
-	cfg          *config.Config
+	cfg             *config.Config
 }
 
 func NewDiagnosisService(
@@ -142,69 +143,55 @@ func (s *diagnosisService) SubmitTask(ctx context.Context, deviceNo string, wave
 }
 
 func (s *diagnosisService) ProcessTask(ctx context.Context, task *model.DiagnosisTask) error {
-	acquired, err := s.cache.MarkTaskProcessing(ctx, task.TaskID)
+	acquired, err := s.repo.AcquireTask(task.TaskID)
 	if err != nil {
-		return err
-	}
-	if !acquired {
-		return fmt.Errorf("task %s is already being processed", task.TaskID)
-	}
-	defer s.cache.UnmarkTaskProcessing(ctx, task.TaskID)
-
-	exists, err := s.repo.ExistsByTaskID(task.TaskID)
-	if err != nil {
-		return err
-	}
-	if !exists {
-		return fmt.Errorf("task %s not found in database", task.TaskID)
+		if strings.Contains(err.Error(), model.TaskAlreadyCompleted) {
+			return nil
+		}
+		if strings.Contains(err.Error(), model.TaskAlreadyRunning) {
+			return fmt.Errorf("task %s is already being processed", task.TaskID)
+		}
+		return fmt.Errorf("failed to acquire task %s: %w", task.TaskID, err)
 	}
 
-	result, err := s.repo.GetByTaskID(task.TaskID)
-	if err != nil {
-		return err
-	}
-	if result == nil {
-		return fmt.Errorf("task %s result not found", task.TaskID)
-	}
+	currentVersion := acquired.Version
 
-	if result.Status == model.DiagnosisStatusComplete || result.Status == model.DiagnosisStatusFailed {
-		return nil
-	}
-
-	if err := s.repo.UpdateStatus(task.TaskID, model.DiagnosisStatusRunning); err != nil {
-		return err
-	}
+	defer func() {
+		if r := recover(); r != nil {
+			_, _ = s.repo.FailTask(task.TaskID, fmt.Sprintf("panic: %v", r), currentVersion)
+		}
+	}()
 
 	if err := s.reloadRules(); err != nil {
-		_ = s.repo.UpdateWithError(task.TaskID, fmt.Sprintf("failed to reload rules: %v", err))
+		_, _ = s.repo.FailTask(task.TaskID, fmt.Sprintf("failed to reload rules: %v", err), currentVersion)
 		return err
 	}
 
 	wf, err := s.waveformRepo.GetByID(task.WaveformID)
 	if err != nil {
-		_ = s.repo.UpdateWithError(task.TaskID, fmt.Sprintf("failed to get waveform: %v", err))
+		_, _ = s.repo.FailTask(task.TaskID, fmt.Sprintf("failed to get waveform: %v", err), currentVersion)
 		return err
 	}
 	if wf == nil {
-		_ = s.repo.UpdateWithError(task.TaskID, "waveform not found")
+		_, _ = s.repo.FailTask(task.TaskID, "waveform not found", currentVersion)
 		return errors.New("waveform not found")
 	}
 
 	vibrationData, err := s.extractVibrationData(wf)
 	if err != nil {
-		_ = s.repo.UpdateWithError(task.TaskID, fmt.Sprintf("failed to extract vibration data: %v", err))
+		_, _ = s.repo.FailTask(task.TaskID, fmt.Sprintf("failed to extract vibration data: %v", err), currentVersion)
 		return err
 	}
 
 	fftResult, err := s.fftAnalyzer.Analyze(vibrationData, wf.SamplingRate)
 	if err != nil {
-		_ = s.repo.UpdateWithError(task.TaskID, fmt.Sprintf("FFT analysis failed: %v", err))
+		_, _ = s.repo.FailTask(task.TaskID, fmt.Sprintf("FFT analysis failed: %v", err), currentVersion)
 		return err
 	}
 
 	valve, err := s.valveRepo.GetByDeviceNo(task.DeviceNo)
 	if err != nil {
-		_ = s.repo.UpdateWithError(task.TaskID, fmt.Sprintf("failed to get valve info: %v", err))
+		_, _ = s.repo.FailTask(task.TaskID, fmt.Sprintf("failed to get valve info: %v", err), currentVersion)
 		return err
 	}
 
@@ -215,20 +202,25 @@ func (s *diagnosisService) ProcessTask(ctx context.Context, task *model.Diagnosi
 
 	diagSummary, err := s.diagnosisEngine.Diagnose(valveType, fftResult, vibrationData)
 	if err != nil {
-		_ = s.repo.UpdateWithError(task.TaskID, fmt.Sprintf("diagnosis failed: %v", err))
+		_, _ = s.repo.FailTask(task.TaskID, fmt.Sprintf("diagnosis failed: %v", err), currentVersion)
 		return err
 	}
 
-	result.MainFrequency = fftResult.MainFrequency
-	result.MainEnergy = fftResult.MainEnergy
+	result := &model.DiagnosisResult{
+		TaskID:       task.TaskID,
+		DeviceNo:     task.DeviceNo,
+		WaveformID:   task.WaveformID,
+		MainFrequency: fftResult.MainFrequency,
+		MainEnergy:   fftResult.MainEnergy,
+		AnomalyScore: diagSummary.AnomalyScore,
+	}
+
 	harmonicJSON, _ := fftResult.HarmonicEnergiesToJSON()
 	result.HarmonicEnergies = harmonicJSON
 	bandJSON, _ := fftResult.BandEnergiesToJSON()
 	result.BandEnergies = bandJSON
-	result.AnomalyScore = diagSummary.AnomalyScore
 	fftJSON, _ := fftResult.ToJSON()
 	result.FFTResult = fftJSON
-	result.Status = model.DiagnosisStatusComplete
 
 	if diagSummary.MainAnomaly != nil {
 		result.AnomalyType = &diagSummary.MainAnomaly.Type
@@ -239,23 +231,29 @@ func (s *diagnosisService) ProcessTask(ctx context.Context, task *model.Diagnosi
 	version, _ := s.ruleRepo.GetLatestVersion()
 	result.RuleVersion = version
 
-	if err := s.repo.UpdateResult(result); err != nil {
-		return err
-	}
-
-	if valve != nil {
-		status := model.ValveStatusNormal
-		if diagSummary.AnomalyScore >= 70 {
-			status = model.ValveStatusCritical
-		} else if diagSummary.AnomalyScore >= 30 {
-			status = model.ValveStatusWarning
+	finalResult, err := s.repo.CompleteTask(result, currentVersion)
+	if err != nil {
+		if strings.Contains(err.Error(), model.TaskAlreadyCompleted) || strings.Contains(err.Error(), model.VersionMismatch) {
+			return nil
 		}
-		_ = s.valveRepo.UpdateStatus(valve.DeviceNo, status)
-		_ = s.cache.SetValveStatus(ctx, valve.DeviceNo, status)
-		_ = s.valveRepo.UpdateLastCheckTime(valve.DeviceNo, time.Now())
+		return fmt.Errorf("failed to complete task: %w", err)
 	}
 
-	_ = s.cache.SetLatestDiagnosis(ctx, task.DeviceNo, result)
+	if finalResult != nil && finalResult.Status == model.DiagnosisStatusComplete {
+		if valve != nil {
+			status := model.ValveStatusNormal
+			if diagSummary.AnomalyScore >= 70 {
+				status = model.ValveStatusCritical
+			} else if diagSummary.AnomalyScore >= 30 {
+				status = model.ValveStatusWarning
+			}
+			_ = s.valveRepo.UpdateStatus(valve.DeviceNo, status)
+			_ = s.cache.SetValveStatus(ctx, valve.DeviceNo, status)
+			_ = s.valveRepo.UpdateLastCheckTime(valve.DeviceNo, time.Now())
+		}
+
+		_ = s.cache.SetLatestDiagnosis(ctx, task.DeviceNo, finalResult)
+	}
 
 	return nil
 }

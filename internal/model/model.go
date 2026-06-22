@@ -84,6 +84,7 @@ type DiagnosisResult struct {
 	DeviceNo        string          `gorm:"size:64;not null;index" json:"device_no"`
 	WaveformID      uint64          `gorm:"not null;index" json:"waveform_id"`
 	Status          DiagnosisStatus `gorm:"size:32;not null;default:pending;index" json:"status"`
+	Version         int64           `gorm:"not null;default:0" json:"version"`
 	MainFrequency   float64         `json:"main_frequency"`
 	MainEnergy      float64         `json:"main_energy"`
 	HarmonicEnergies string         `gorm:"type:text" json:"harmonic_energies"`
@@ -103,6 +104,13 @@ type DiagnosisResult struct {
 	Waveform *Waveform `gorm:"foreignKey:WaveformID" json:"waveform,omitempty"`
 	Valve    *Valve    `gorm:"foreignKey:DeviceNo;references:DeviceNo" json:"valve,omitempty"`
 }
+
+const (
+	StateTransitionError = "invalid state transition"
+	TaskAlreadyCompleted = "task already completed"
+	TaskAlreadyRunning   = "task already running"
+	VersionMismatch      = "version mismatch"
+)
 
 type RuleConfig struct {
 	ID            uint64         `gorm:"primaryKey;autoIncrement" json:"id"`
